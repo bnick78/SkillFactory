@@ -1,0 +1,100 @@
+-- БОЛЬШОЙ ЗАПРОС ДЛЯ ПОЛУЧЕНИЯ НАБОРА ДАННЫХ ДЛЯ АНАЛИЗА ПРИБЫЛЬНОСТИ РЕЙСОВ
+--
+-- Небольшое пояснение относительно моего форматирования запроса: считаю, что капслок в названиях 
+-- ключевых слов и функций - замедляет написание запросов и отвлекает внимание, 
+-- при том что цветовая подсветка синтаксиса прекрасно выделяет эти слова и при написании 
+-- маленькими буквами, т.е. читаемость запроса не ухудшается совсем.
+-- На проектах в компании, где я работаю, мы не пользуемся капслоком, поэтому я не стал этого делать и здесь.
+-- Форматирование, предлагаемое сайтом https://sqlformat.org/ - спорное, выводить атрибуты в строке с select - 
+-- неправильная практика, лучше выводить атрибуты начиная со следующей строки. К тому же он испортил форматирование 
+-- моего большого запроса.
+-- https://www.sqlstyle.guide/ru/ - многие примеры, которые здесь есть - либо требуют много затрат на форматирование, 
+-- либо ухудшают читаемость запроса и неоправданно его растягивают. Например, запрос ниже ужасен, если предположить, 
+-- что джоинов будет хотя бы 5 штук 
+-- SELECT r.last_name
+--   FROM riders AS r
+--        INNER JOIN bikes AS b
+--        ON r.bike_vin_num = b.vin_num
+--           AND b.engine_tally > 2
+
+
+with 
+fligt_ids as ( --запрос для получения списка идентификаторов интересующих нас рейсов для последующей фильтрации
+	select 
+		f.flight_id
+	from dst_project.flights f 
+	where f.departure_airport = 'AAQ'
+  		and (date_trunc('month', f.scheduled_departure) in ('2017-01-01','2017-02-01', '2017-12-01'))
+  		and f.status not in ('Cancelled')
+),
+
+ticket_sum as ( --подсчет дохода на рейс и количества проданных билетов на рейс
+	select
+		tf.flight_id,
+		sum(tf.amount) as revenue,
+		count(*) as cnt_tickets
+	from dst_project.ticket_flights tf
+	inner join fligt_ids f on tf.flight_id =f.flight_id
+	group by tf.flight_id 
+),
+
+seats_sum as ( --подсчет общего количества мест в модели самолета
+	select 
+		s.aircraft_code,
+		count(s.seat_no) as cnt_seats
+	from dst_project.seats s 
+	group by s.aircraft_code
+),
+occupied_seats as ( --подсчет количества занятых мест на рейсе
+	select 
+		bp.flight_id,
+		count(bp.seat_no) as cnt_occup_seats
+	from dst_project.boarding_passes bp 
+	inner join fligt_ids f on f.flight_id =bp.flight_id 
+	group by bp.flight_id
+),
+
+fuel as ( --набор с данным по расходу топлива в минутах по двум самолетам - 733 и SU9
+			-- данные по расходу топлива в час получены с сайта
+			-- https://class-tour.com/rashod-topliva-raznyh-samoletov/
+    select 
+        2400/60 as fuel_on_minute, --2400 - расход в килограммах для 733 на час полета, 
+        							--60 - делим на количество минут в часе, чтобы получить расход в минуту
+        56.363 as fuel_cost, --стоимость топлива в Анапе https://favt.gov.ru/dejatelnost-ajeroporty-i-ajerodromy-ceny-na-aviagsm?id=7379
+        '733' as aircraft_code
+    
+    union all
+    
+    select 
+        1700/60 as fuel_on_minute, --1700 - расход топлива для SU9 в килограммах на час полета, делим на 60 минут
+        56.363 as fuel_cost,
+        'SU9' as aircraft_code
+)
+select 
+	f.flight_id,                            --идентификатор рейса
+	f.flight_no,                            --номер рейса
+	f.arrival_airport,                      --код аэропорта прибытия
+	a.city,                                 --город аэропорта прибытия
+	EXTRACT(HOUR from f.actual_arrival - f.actual_departure)*60+EXTRACT(MINUTE from f.actual_arrival - f.actual_departure) as duration_in_minutes, --длительность полета в минутах
+	f.aircraft_code,                        --код самолета
+	a2.model as aircraft_model,             --модель самолета
+	fuel.fuel_on_minute,                    --расход самолетом топлива в минутах
+	fuel.fuel_cost,                         --стоимость одного килограмма топлива в рублях, в Анапе
+	ss.cnt_seats as aircraft_seats,         --количество мест в самолете
+	os.cnt_occup_seats as occupied_seats,   --количество занятых мест на рейсе
+	tf.revenue,                             --доход от продажи билетов на рейсе
+	tf.cnt_tickets as tickets_count         --количество проданных билетов
+from dst_project.flights f
+left join seats_sum ss on f.aircraft_code=ss.aircraft_code --получаем количество мест в модели самолета
+left join occupied_seats os on f.flight_id=os.flight_id --получаем количество занятых мест на рейсе, без этого соединения можно обойтись, т.к. количество занятых мест оказалось равно количеству купленных билетов на рейсе
+left join ticket_sum tf on f.flight_id = tf.flight_id --получаем доход на рейс и количество купленных билетов
+left join dst_project.airports a on f.arrival_airport=a.airport_code --получаем город, где находится аэропорт прилета
+left join dst_project.aircrafts a2 on f.aircraft_code = a2.aircraft_code  --получаем название модели самолета
+left join fuel on f.aircraft_code = fuel.aircraft_code --получаем расход и цену топлива для модели самолета
+where f.departure_airport = 'AAQ' --выбраем рейсы, где аэропорт вылета "ААQ" (Анапа)
+  and (date_trunc('month', f.scheduled_departure) in ('2017-01-01','2017-02-01', '2017-12-01')) --вылет рейса запланирован на январь, февраль и декабрь 2017 года
+  and f.status not in ('Cancelled') --выбираем неотмененные рейсы
+
+  
+  
+  
